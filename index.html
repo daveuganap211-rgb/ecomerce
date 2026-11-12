@@ -2169,16 +2169,6 @@ function handleRegister(event) {
         return;
     }
 
-    if (email === "admin@desoundsource.com") {
-
-        showToast(
-            "This email address is reserved.",
-            "error"
-        );
-
-        return;
-    }
-
     if (password.length < 6) {
 
         showToast(
@@ -4124,7 +4114,7 @@ sched();
 <script>
 (function(){
 "use strict";
-const AD="admin@desoundsource.com",U="deSoundsource_users",SK="deSoundsource_stock",LK="deSoundsource_log",MK="deSoundsource_msgs",OK=e=>"deSoundsource_orders_"+e,FUT=2e14,STG=["To Ship","To Deliver","To Receive"];
+const AD="daveuganap211@gmail.com",U="deSoundsource_users",SK="deSoundsource_stock",LK="deSoundsource_log",MK="deSoundsource_msgs",OK=e=>"deSoundsource_orders_"+e,FUT=2e14,STG=["To Ship","To Deliver","To Receive"];
 const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])),php=n=>"₱"+Number(n||0).toLocaleString();
 const isAdm=()=>!!currentUser&&currentUser.email===AD,users=()=>storage.get(U,[]),stock=()=>storage.get(SK,{}),qty=id=>{const s=stock();return id in s?s[id]:20},msgs=()=>storage.get(MK,[]),logs=()=>storage.get(LK,[]);
 const ap=o=>o.approval||"Approved",st=o=>Math.min(Math.max(o.statusIndex||0,0),2),go=()=>navigate(currentPage);
