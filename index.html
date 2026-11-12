@@ -639,6 +639,14 @@ body.cs-lock{overflow:hidden}
                 </div>
 
                 <div class="form-group">
+                    <label for="loginRole">Log in as</label>
+                    <select id="loginRole" class="form-control">
+                        <option value="customer">Customer</option>
+                        <option value="admin">Administrator</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
                     <label for="loginPassword">Password</label>
 
                     <div class="password-wrap">
@@ -1933,6 +1941,7 @@ let currentPage = "home";
 
 let statusTimer = null;
 
+const ADMIN_EMAIL = "daveuganap211@gmail.com";
 const ORDER_STATUSES = ["To Ship", "To Deliver", "To Receive"];
 
 
@@ -2099,10 +2108,15 @@ function handleLogin(event) {
             account.password === password
     );
 
-    if (!user) {
+    const accountIsAdmin =
+        user && user.email.toLowerCase() === ADMIN_EMAIL;
+    const requestedAdmin =
+        document.getElementById("loginRole").value === "admin";
+
+    if (!user || accountIsAdmin !== requestedAdmin) {
 
         showToast(
-            "Incorrect email or password. Please try again.",
+            "Incorrect email, password or account type. Please try again.",
             "error"
         );
 
@@ -4114,9 +4128,9 @@ sched();
 <script>
 (function(){
 "use strict";
-const AD="daveuganap211@gmail.com",U="deSoundsource_users",SK="deSoundsource_stock",LK="deSoundsource_log",MK="deSoundsource_msgs",OK=e=>"deSoundsource_orders_"+e,FUT=2e14,STG=["To Ship","To Deliver","To Receive"];
+const AD=ADMIN_EMAIL,U="deSoundsource_users",SK="deSoundsource_stock",LK="deSoundsource_log",MK="deSoundsource_msgs",OK=e=>"deSoundsource_orders_"+e,FUT=2e14,STG=["To Ship","To Deliver","To Receive"];
 const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])),php=n=>"₱"+Number(n||0).toLocaleString();
-const isAdm=()=>!!currentUser&&currentUser.email===AD,users=()=>storage.get(U,[]),stock=()=>storage.get(SK,{}),qty=id=>{const s=stock();return id in s?s[id]:20},msgs=()=>storage.get(MK,[]),logs=()=>storage.get(LK,[]);
+const isAdm=()=>!!currentUser&&currentUser.email.toLowerCase()===AD,users=()=>storage.get(U,[]),stock=()=>storage.get(SK,{}),qty=id=>{const s=stock();return id in s?s[id]:20},msgs=()=>storage.get(MK,[]),logs=()=>storage.get(LK,[]);
 const ap=o=>o.approval||"Approved",st=o=>Math.min(Math.max(o.statusIndex||0,0),2),go=()=>navigate(currentPage);
 const ago=t=>{const m=Math.floor((Date.now()-t)/6e4);return m<1?"Just now":m<60?m+"m ago":m<1440?Math.floor(m/60)+"h ago":Math.floor(m/1440)+"d ago"};
 function logA(a){const l=logs();l.push({id:(l.length?l[l.length-1].id:0)+1,time:new Date().toLocaleString("en-PH"),user:currentUser?currentUser.email:"-",action:a});storage.set(LK,l.slice(-300))}
