@@ -591,12 +591,12 @@ body.cs-lock{overflow:hidden}
             <h4>What we keep</h4>
             <ul>
               <li>Your name, email, phone number, delivery address, cart, vouchers and order history.</li>
-              <li>Your profile picture, if you add one. It never leaves this device.</li>
+              <li>Your profile picture, if you add one, is saved with your Supabase profile.</li>
             </ul>
             <h4>Where it is kept</h4>
             <ul>
-              <li>This is a demo shop. Your data is stored <b>only in this browser</b> and is not sent to any server or sold or shared with anyone.</li>
-              <li>Because it is a demo, passwords are saved in your browser as typed. Please do <b>not</b> reuse a real password from another site.</li>
+              <li>Account and shop data are stored in the D&amp;E Soundsource Supabase project. Customer accounts can access their own data; administrators manage shared shop data.</li>
+              <li>Passwords are handled by Supabase Auth and are not stored in the shop database. Use a unique password and avoid entering sensitive information in this demo.</li>
             </ul>
             <h4>Payments</h4>
             <ul>
@@ -1252,8 +1252,8 @@ body.cs-lock{overflow:hidden}
 
             <h3>5. Privacy</h3>
             <p>
-                This prototype stores account and order information locally
-                in the user's browser.
+                Account and shop data are stored in the project's Supabase
+                database. Passwords are handled separately by Supabase Auth.
             </p>
 
         </div>
@@ -1391,7 +1391,7 @@ body.cs-lock{overflow:hidden}
         <form id="profileForm" class="profile-form">
           <div class="form-group"><label for="profileFirstName">First Name</label><input id="profileFirstName" class="form-control" required></div>
           <div class="form-group"><label for="profileLastName">Last Name</label><input id="profileLastName" class="form-control" required></div>
-          <div class="form-group full"><label for="profileEmail">Email Address</label><input id="profileEmail" type="email" class="form-control" required></div>
+          <div class="form-group full"><label for="profileEmail">Email Address</label><input id="profileEmail" type="email" class="form-control" required readonly><small>Email changes must be confirmed through Supabase Auth.</small></div>
           <div class="form-group full"><label for="profilePhone">Phone Number</label><input id="profilePhone" class="form-control" placeholder="09XXXXXXXXX"></div>
           <div class="form-group full"><label for="profileAddress">Delivery Address</label><textarea id="profileAddress" class="form-control" rows="3" placeholder="Enter your complete delivery address"></textarea></div>
           <div class="full"><button type="submit" class="btn btn-primary btn-full">💾 Save Changes</button></div>
@@ -1457,6 +1457,7 @@ window.addEventListener('error',function(e){const t=e.target;if(!t||t.tagName!==
   const p=(window.products||[]).find(x=>x.image===t.getAttribute('src'));
   if(p&&p.art&&t.getAttribute('src')!==p.art){t.dataset.fb='1';t.src=p.art}},true);
 </script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 /* =========================================================
    D&E SOUNDSOURCE JAVASCRIPT
@@ -1468,10 +1469,368 @@ window.addEventListener('error',function(e){const t=e.target;if(!t||t.tagName!==
    ========================================================= */
 
 const memoryStorage = {};
+const stateWriteQueues = new Map();
+let cloudStateReady = false;
+let profileCache = [];
+const SUPABASE_URL = "https://taczbvxvyvrswkhgdbxv.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_k4pgV2RN_8OApBbrkif-TA_mhvCVga8";
+const supabaseClient = window.supabase?.createClient
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+    : null;
+
+function cacheStorageValue(key, value) {
+    try {
+        localStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+        memoryStorage[key] = value;
+    }
+}
+
+function reportCloudError(action, error) {
+    console.error("Supabase " + action + " failed:", error);
+    if (typeof showToast === "function") {
+        showToast("Supabase " + action + " failed: " + error.message, "error");
+    }
+}
+
+function profileIdForEmail(email) {
+    const profile = profileCache.find(
+        item => item.email.toLowerCase() === String(email || "").toLowerCase()
+    );
+    return profile ? profile.id : null;
+}
+
+function messageOwnerEmail(message) {
+    if (String(message.to || "").toLowerCase() === ADMIN_EMAIL) {
+        return String(message.from || "").toLowerCase() === "admin"
+            ? ADMIN_EMAIL
+            : message.from;
+    }
+    return message.to;
+}
+
+async function writeCloudState(key, value, sessionUser) {
+    if (!supabaseClient || !sessionUser || !cloudStateReady || currentUser?.id !== sessionUser.id) return;
+
+    const admin = sessionUser.email.toLowerCase() === ADMIN_EMAIL;
+    let rows;
+
+    if (value === null) {
+        if ((key === "deSoundsource_stock" || key === "deSoundsource_products") && !admin) return;
+        const scopes = key === "deSoundsource_stock" || key === "deSoundsource_products"
+            ? ["global"]
+            : admin && (key === "deSoundsource_msgs" || key === "deSoundsource_log")
+                ? profileCache.map(profile => profile.id)
+                : [sessionUser.id];
+        if (!scopes.length) return;
+        const {error} = await supabaseClient
+            .from("shop_state")
+            .delete()
+            .eq("key", key)
+            .in("scope_id", scopes);
+        if (error) throw error;
+        return;
+    }
+
+    if (key === "deSoundsource_stock" || key === "deSoundsource_products") {
+        if (!admin) return;
+        rows = [{scope_id: "global", key, value}];
+    } else if (admin && (key === "deSoundsource_msgs" || key === "deSoundsource_log")) {
+        const grouped = new Map();
+        const getOwner = key === "deSoundsource_msgs"
+            ? messageOwnerEmail
+            : item => item.user;
+
+        value.forEach(item => {
+            const ownerId = profileIdForEmail(getOwner(item));
+            if (!ownerId) return;
+            if (!grouped.has(ownerId)) grouped.set(ownerId, []);
+            grouped.get(ownerId).push(item);
+        });
+
+        rows = profileCache.map(profile => ({
+            scope_id: profile.id,
+            key,
+            value: grouped.get(profile.id) || []
+        }));
+    } else {
+        rows = [{scope_id: sessionUser.id, key, value}];
+    }
+
+    const {error} = await supabaseClient
+        .from("shop_state")
+        .upsert(rows, {onConflict: "scope_id,key"});
+    if (error) throw error;
+}
+
+function queueCloudStateWrite(key, value) {
+    const prior = stateWriteQueues.get(key) || Promise.resolve();
+    const snapshot = JSON.parse(JSON.stringify(value));
+    const sessionUser = currentUser ? {id: currentUser.id, email: currentUser.email} : null;
+    const write = prior
+        .then(() => writeCloudState(key, snapshot, sessionUser))
+        .catch(error => reportCloudError("save", error));
+    stateWriteQueues.set(key, write);
+}
+
+function fromProfileRow(row) {
+    return {
+        id: row.id,
+        email: row.email,
+        firstName: row.first_name || "",
+        lastName: row.last_name || "",
+        phone: row.phone || "",
+        address: row.address || "",
+        image: row.image || "",
+        is_active: row.is_active
+    };
+}
+
+function readLegacyState(email) {
+    const result = {};
+    const suffix = "_" + email.toLowerCase();
+    const sharedBackup = {
+        "deSoundsource_legacy_stock": "deSoundsource_stock",
+        "deSoundsource_legacy_msgs": "deSoundsource_msgs",
+        "deSoundsource_legacy_log": "deSoundsource_log"
+    };
+    const userPrefixes = [
+        "deSoundsource_cart_",
+        "deSoundsource_orders_",
+        "deSoundsource_profile_",
+        "deSoundsource_vouchers_",
+        "deSoundsource_vapplied_"
+    ];
+
+    for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith("deSoundsource_")) continue;
+        const targetKey = sharedBackup[key];
+        const isCurrentUserKey = userPrefixes.some(
+            prefix => key.toLowerCase().startsWith(prefix.toLowerCase())
+                && key.toLowerCase().endsWith(suffix)
+        );
+        const isMigratableSharedKey = [
+            "deSoundsource_stock",
+            "deSoundsource_msgs",
+            "deSoundsource_log",
+            "deSoundsource_theme"
+        ].includes(key);
+        if (!isCurrentUserKey && !isMigratableSharedKey && !targetKey) continue;
+
+        try {
+            const value = JSON.parse(localStorage.getItem(key));
+            const destination = targetKey || key;
+            if (Object.prototype.hasOwnProperty.call(result, destination)
+                && Array.isArray(value) && Array.isArray(result[destination])) {
+                result[destination] = [...new Map(
+                    [...result[destination], ...value].map(item => [
+                        destination === "deSoundsource_msgs"
+                            ? [item.id, item.from, item.to, item.subject].join("|")
+                            : [item.time, item.user, item.action].join("|"),
+                        item
+                    ])
+                ).values()];
+            } else {
+                result[destination] = value;
+            }
+        } catch (error) {
+            console.warn("Skipping invalid legacy app data for " + key, error);
+        }
+    }
+
+    return result;
+}
+
+function clearCachedAppState(email, legacy) {
+    const suffix = "_" + email.toLowerCase();
+    for (const [key, backup] of [
+        ["deSoundsource_stock", "deSoundsource_legacy_stock"],
+        ["deSoundsource_msgs", "deSoundsource_legacy_msgs"],
+        ["deSoundsource_log", "deSoundsource_legacy_log"]
+    ]) {
+        if (Object.prototype.hasOwnProperty.call(legacy, key)
+            && localStorage.getItem(backup) === null) {
+            localStorage.setItem(backup, JSON.stringify(legacy[key]));
+        }
+    }
+
+    const userPrefixes = [
+        "deSoundsource_cart_",
+        "deSoundsource_orders_",
+        "deSoundsource_profile_",
+        "deSoundsource_vouchers_",
+        "deSoundsource_vapplied_"
+    ];
+    const shouldClear = key => {
+        if (!key || !key.startsWith("deSoundsource_")) return false;
+        if (key.startsWith("deSoundsource_legacy_")) return false;
+        const isUserState = userPrefixes.some(prefix => key.toLowerCase().startsWith(prefix));
+        return !isUserState || key.toLowerCase().endsWith(suffix);
+    };
+
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i);
+        if (shouldClear(key)) {
+            localStorage.removeItem(key);
+        }
+    }
+    Object.keys(memoryStorage).forEach(key => {
+        if (shouldClear(key)) delete memoryStorage[key];
+    });
+}
+
+function getLegacyProfile(legacy, email) {
+    const key = Object.keys(legacy).find(
+        name => name.toLowerCase() === ("deSoundsource_profile_" + email).toLowerCase()
+    );
+    return key ? legacy[key] : null;
+}
+
+async function hydrateCloudState(authUser) {
+    cloudStateReady = false;
+    const email = authUser.email.toLowerCase();
+    const legacy = readLegacyState(email);
+    clearCachedAppState(email, legacy);
+
+    const {data: profileRows, error: profileError} = await supabaseClient
+        .from("profiles")
+        .select("id,email,first_name,last_name,phone,address,image,is_active,created_at")
+        .order("created_at");
+    if (profileError) throw profileError;
+
+    profileCache = (profileRows || []).map(fromProfileRow);
+    const profile = profileCache.find(item => item.id === authUser.id);
+    if (!profile) {
+        throw new Error("No profile exists for this account. Run supabase-setup.sql first.");
+    }
+    if (!profile.is_active) {
+        throw new Error("This account has been disabled. Contact the store administrator.");
+    }
+
+    const {data: stateRows, error: stateError} = await supabaseClient
+        .from("shop_state")
+        .select("scope_id,key,value");
+    if (stateError) throw stateError;
+
+    const existing = new Set();
+    const aggregated = {"deSoundsource_msgs": [], "deSoundsource_log": []};
+    for (const row of stateRows || []) {
+        existing.add(row.scope_id + "\n" + row.key);
+        if (authUser.email.toLowerCase() === ADMIN_EMAIL
+            && (row.key === "deSoundsource_msgs" || row.key === "deSoundsource_log")) {
+            if (Array.isArray(row.value)) aggregated[row.key].push(...row.value);
+        } else {
+            cacheStorageValue(row.key, row.value);
+        }
+    }
+
+    if (authUser.email.toLowerCase() === ADMIN_EMAIL) {
+        cacheStorageValue("deSoundsource_msgs", aggregated["deSoundsource_msgs"]);
+        cacheStorageValue("deSoundsource_log", aggregated["deSoundsource_log"]);
+    }
+    cacheStorageValue("deSoundsource_users", profileCache);
+
+    let activeProfile = profile;
+    const legacyProfile = getLegacyProfile(legacy, email);
+    if (legacyProfile) {
+        activeProfile = {
+            ...profile,
+            phone: profile.phone || legacyProfile.phone || "",
+            address: profile.address || legacyProfile.address || "",
+            image: profile.image || legacyProfile.image || ""
+        };
+        const {error} = await supabaseClient.from("profiles").update({
+            phone: activeProfile.phone,
+            address: activeProfile.address,
+            image: activeProfile.image
+        }).eq("id", authUser.id);
+        if (error) throw error;
+        profileCache = profileCache.map(item => item.id === authUser.id ? activeProfile : item);
+        cacheStorageValue("deSoundsource_users", profileCache);
+    }
+
+    currentUser = {
+        id: authUser.id,
+        email,
+        firstName: activeProfile.firstName,
+        lastName: activeProfile.lastName
+    };
+
+    for (const [key, value] of Object.entries(legacy)) {
+        const perUser = key.toLowerCase().endsWith("_" + email);
+        const ownerKeyExists = existing.has(authUser.id + "\n" + key);
+        const isGlobalKey = key === "deSoundsource_stock" || key === "deSoundsource_products";
+        const globalExists = existing.has("global\n" + key);
+
+        if (perUser && !ownerKeyExists) {
+            cacheStorageValue(key, value);
+            storage.set(key, value);
+        } else if (isGlobalKey && !globalExists && email === ADMIN_EMAIL) {
+            cacheStorageValue(key, value);
+            storage.set(key, value);
+        } else if (key === "deSoundsource_theme" && !ownerKeyExists) {
+            cacheStorageValue(key, value);
+            storage.set(key, value);
+        }
+    }
+
+    if (email === ADMIN_EMAIL && !existing.has("global\ndeSoundsource_products")) {
+        storage.set("deSoundsource_products", products);
+    } else {
+        const catalogRow = (stateRows || []).find(
+            row => row.scope_id === "global" && row.key === "deSoundsource_products"
+        );
+        if (catalogRow && Array.isArray(catalogRow.value)) {
+            products.splice(0, products.length, ...catalogRow.value);
+        }
+    }
+
+    for (const key of ["deSoundsource_msgs", "deSoundsource_log"]) {
+        if (Object.prototype.hasOwnProperty.call(legacy, key)) {
+            const imported = Array.isArray(legacy[key]) ? legacy[key] : [];
+            const owned = email === ADMIN_EMAIL ? imported : imported.filter(item => key === "deSoundsource_msgs"
+                ? messageOwnerEmail(item)?.toLowerCase() === email
+                : String(item.user || "").toLowerCase() === email);
+            if (owned.length) {
+                const current = storage.get(key, []);
+                const fingerprint = item => key === "deSoundsource_msgs"
+                    ? [item.id, item.from, item.to, item.subject].join("|")
+                    : [item.time, item.user, item.action].join("|");
+                const known = new Set(current.map(fingerprint));
+                const additions = owned.filter(item => {
+                    const id = fingerprint(item);
+                    if (known.has(id)) return false;
+                    known.add(id);
+                    return true;
+                });
+                if (additions.length) {
+                    const merged = [...current, ...additions];
+                    cacheStorageValue(key, merged);
+                    storage.set(key, merged);
+                }
+            }
+        }
+    }
+
+    cloudStateReady = true;
+    await Promise.all(stateWriteQueues.values());
+    cacheStorageValue("deSoundsource_profile_" + email, {
+        firstName: activeProfile.firstName,
+        lastName: activeProfile.lastName,
+        email,
+        phone: activeProfile.phone,
+        address: activeProfile.address,
+        image: activeProfile.image
+    });
+}
 
 const storage = {
 
     get(key, fallback = null) {
+        if (Object.prototype.hasOwnProperty.call(memoryStorage, key)) {
+            return memoryStorage[key];
+        }
         try {
             const value = localStorage.getItem(key);
 
@@ -1489,10 +1848,9 @@ const storage = {
     },
 
     set(key, value) {
-        try {
-            localStorage.setItem(key, JSON.stringify(value));
-        } catch (error) {
-            memoryStorage[key] = value;
+        cacheStorageValue(key, value);
+        if (key !== "deSoundsource_users" && key !== "deSoundsource_session") {
+            queueCloudStateWrite(key, value);
         }
     },
 
@@ -1502,9 +1860,15 @@ const storage = {
         } catch (error) {
             delete memoryStorage[key];
         }
+        if (key !== "deSoundsource_users" && key !== "deSoundsource_session") {
+            queueCloudStateWrite(key, null);
+        }
     }
 
 };
+
+storage.remove("deSoundsource_users");
+storage.remove("deSoundsource_session");
 
 
 /* =========================================================
@@ -1952,15 +2316,7 @@ const ORDER_STATUSES = ["To Ship", "To Deliver", "To Receive"];
 document.addEventListener("DOMContentLoaded", () => {
 
     setupEvents();
-
-    const session = storage.get("deSoundsource_session", null);
-
-    if (session) {
-        currentUser = session;
-
-        openApplication(false);
-    }
-
+    initializeAuth();
 });
 
 
@@ -2086,169 +2442,141 @@ function showAuthForm(type) {
 }
 
 
-function handleLogin(event) {
-
-    event.preventDefault();
-
-    const email = document
-        .getElementById("loginEmail")
-        .value
-        .trim()
-        .toLowerCase();
-
-    const password = document
-        .getElementById("loginPassword")
-        .value;
-
-    const users = storage.get("deSoundsource_users", []);
-
-    const user = users.find(
-        account =>
-            account.email.toLowerCase() === email &&
-            account.password === password
-    );
-
-    const accountIsAdmin =
-        user && user.email.toLowerCase() === ADMIN_EMAIL;
-    const requestedAdmin =
-        document.getElementById("loginRole").value === "admin";
-
-    if (!user || accountIsAdmin !== requestedAdmin) {
-
-        showToast(
-            "Incorrect email, password or account type. Please try again.",
-            "error"
-        );
-
-        return;
+function setAuthBusy(form, busy, label) {
+    const button = form.querySelector('[type="submit"]');
+    if (!button) return;
+    if (busy) {
+        button.dataset.originalLabel = button.textContent;
+        button.disabled = true;
+        button.textContent = label;
+    } else {
+        button.disabled = false;
+        button.textContent = button.dataset.originalLabel || button.textContent;
     }
-
-    currentUser = {
-        firstName: user.firstName,
-        lastName: user.lastName,
-        email: user.email
-    };
-
-    storage.set("deSoundsource_session", currentUser);
-
-    loadUserData();
-
-    openApplication();
-
-    document.getElementById("loginForm").reset();
-
-    showToast("Welcome back, " + user.firstName + "!", "success");
-
 }
 
+async function activateAuthUser(authUser, welcome) {
+    if (!authUser || !authUser.email) {
+        showToast("Supabase did not return a valid account.", "error");
+        return false;
+    }
+    if (authUser.email.toLowerCase() === ADMIN_EMAIL && !authUser.email_confirmed_at) {
+        const {error} = await supabaseClient.auth.signOut();
+        if (error) console.error("Could not clear the unconfirmed admin session:", error);
+        showToast("Verify the administrator email address before signing in.", "error");
+        return false;
+    }
 
-function handleRegister(event) {
+    try {
+        await hydrateCloudState(authUser);
+        openApplication();
+        if (welcome) {
+            showToast("Welcome back, " + (currentUser.firstName || "Admin") + "!", "success");
+        }
+        return true;
+    } catch (error) {
+        cloudStateReady = false;
+        currentUser = null;
+        console.error("Could not load the Supabase account data:", error);
+        const {error: signOutError} = await supabaseClient.auth.signOut();
+        if (signOutError) console.error("Could not clear the rejected Supabase session:", signOutError);
+        showToast("Unable to load your account: " + error.message, "error");
+        return false;
+    }
+}
 
+async function initializeAuth() {
+    if (!supabaseClient) {
+        showToast("Supabase could not be loaded. Check your connection and reload.", "error");
+        return;
+    }
+
+    try {
+        const {data, error} = await supabaseClient.auth.getSession();
+        if (error) throw error;
+        if (data.session) {
+            await activateAuthUser(data.session.user, false);
+        }
+    } catch (error) {
+        reportCloudError("session restore", error);
+    }
+}
+
+async function handleLogin(event) {
     event.preventDefault();
-
-    const firstName = document
-        .getElementById("registerFirstName")
-        .value
-        .trim();
-
-    const lastName = document
-        .getElementById("registerLastName")
-        .value
-        .trim();
-
-    const email = document
-        .getElementById("registerEmail")
-        .value
-        .trim()
-        .toLowerCase();
-
-    const password = document
-        .getElementById("registerPassword")
-        .value;
-
-    const confirmPassword = document
-        .getElementById("confirmPassword")
-        .value;
-
-    const agreeTerms =
-        document.getElementById("agreeTerms").checked;
-
-    if (!agreeTerms) {
-
-        showToast(
-            "Please agree to the Terms and Conditions.",
-            "error"
-        );
-
+    if (!supabaseClient) {
+        showToast("Supabase is unavailable. Check your connection and reload.", "error");
         return;
     }
 
+    const form = event.currentTarget;
+    const email = document.getElementById("loginEmail").value.trim().toLowerCase();
+    const password = document.getElementById("loginPassword").value;
+    const requestedAdmin = document.getElementById("loginRole").value === "admin";
+    if ((email === ADMIN_EMAIL) !== requestedAdmin) {
+        showToast("Choose the account type that matches this email address.", "error");
+        return;
+    }
+
+    setAuthBusy(form, true, "Signing in...");
+    try {
+        const {data, error} = await supabaseClient.auth.signInWithPassword({email, password});
+        if (error) throw error;
+        if (await activateAuthUser(data.user, true)) form.reset();
+    } catch (error) {
+        showToast("Unable to sign in: " + error.message, "error");
+    } finally {
+        setAuthBusy(form, false);
+    }
+}
+
+async function handleRegister(event) {
+    event.preventDefault();
+    if (!supabaseClient) {
+        showToast("Supabase is unavailable. Check your connection and reload.", "error");
+        return;
+    }
+
+    const form = event.currentTarget;
+    const firstName = document.getElementById("registerFirstName").value.trim();
+    const lastName = document.getElementById("registerLastName").value.trim();
+    const email = document.getElementById("registerEmail").value.trim().toLowerCase();
+    const password = document.getElementById("registerPassword").value;
+    const confirmPassword = document.getElementById("confirmPassword").value;
+    if (!document.getElementById("agreeTerms").checked) {
+        showToast("Please agree to the Terms and Conditions.", "error");
+        return;
+    }
     if (password.length < 6) {
-
-        showToast(
-            "Password must contain at least 6 characters.",
-            "error"
-        );
-
+        showToast("Password must contain at least 6 characters.", "error");
         return;
     }
-
     if (password !== confirmPassword) {
-
-        showToast(
-            "Passwords do not match.",
-            "error"
-        );
-
+        showToast("Passwords do not match.", "error");
         return;
     }
 
-    let users = storage.get("deSoundsource_users", []);
-
-    const exists = users.some(
-        user => user.email.toLowerCase() === email
-    );
-
-    if (exists) {
-
-        showToast(
-            "An account with this email already exists.",
-            "error"
-        );
-
-        return;
+    setAuthBusy(form, true, "Creating account...");
+    try {
+        const {data, error} = await supabaseClient.auth.signUp({
+            email,
+            password,
+            options: {data: {first_name: firstName, last_name: lastName}}
+        });
+        if (error) throw error;
+        form.reset();
+        if (data.session) {
+            await activateAuthUser(data.user, false);
+        } else {
+            document.getElementById("loginEmail").value = email;
+            showAuthForm("login");
+            showToast("Account created. Check your email to confirm it, then sign in.", "success");
+        }
+    } catch (error) {
+        showToast("Unable to create account: " + error.message, "error");
+    } finally {
+        setAuthBusy(form, false);
     }
-
-    const newUser = {
-        firstName,
-        lastName,
-        email,
-        password
-    };
-
-    users.push(newUser);
-
-    storage.set("deSoundsource_users", users);
-
-    currentUser = {
-        firstName,
-        lastName,
-        email
-    };
-
-    storage.set("deSoundsource_session", currentUser);
-
-    document.getElementById("registerForm").reset();
-
-    loadUserData();
-
-    openApplication();
-
-    showToast(
-        "Account created successfully!",
-        "success"
-    );
-
 }
 
 
@@ -2545,142 +2873,51 @@ function renderProfile() {
 }
 
 
-function saveProfile(event) {
-
+async function saveProfile(event) {
     event.preventDefault();
+    const firstName = document.getElementById("profileFirstName").value.trim();
+    const lastName = document.getElementById("profileLastName").value.trim();
+    const email = document.getElementById("profileEmail").value.trim().toLowerCase();
+    const phone = document.getElementById("profilePhone").value.trim();
+    const address = document.getElementById("profileAddress").value.trim();
 
-    const oldEmail = currentUser.email;
-
-    const firstName =
-        document.getElementById("profileFirstName").value.trim();
-
-    const lastName =
-        document.getElementById("profileLastName").value.trim();
-
-    const email =
-        document.getElementById("profileEmail").value.trim().toLowerCase();
-
-    const phone =
-        document.getElementById("profilePhone").value.trim();
-
-    const address =
-        document.getElementById("profileAddress").value.trim();
-
-    let users =
-        storage.get("deSoundsource_users", []);
-
-    const duplicate = users.some(
-        user =>
-            user.email.toLowerCase() === email &&
-            user.email.toLowerCase() !== oldEmail.toLowerCase()
-    );
-
-    if (duplicate) {
-
-        showToast(
-            "That email is already being used.",
-            "error"
-        );
-
+    if (email !== currentUser.email) {
+        showToast("Change the account email through Supabase Auth email confirmation.", "error");
+        document.getElementById("profileEmail").value = currentUser.email;
         return;
     }
 
-    const userIndex =
-        users.findIndex(
-            user =>
-                user.email.toLowerCase() ===
-                oldEmail.toLowerCase()
-        );
+    try {
+        const oldProfile = getProfile();
+        const updatedProfile = {
+            ...oldProfile,
+            firstName,
+            lastName,
+            email: currentUser.email,
+            phone,
+            address
+        };
+        const {error} = await supabaseClient.from("profiles").update({
+            first_name: firstName,
+            last_name: lastName,
+            phone,
+            address
+        }).eq("id", currentUser.id);
+        if (error) throw error;
 
-    if (userIndex !== -1) {
-
-        users[userIndex].firstName = firstName;
-        users[userIndex].lastName = lastName;
-        users[userIndex].email = email;
-
-        storage.set(
-            "deSoundsource_users",
-            users
-        );
-
+        currentUser.firstName = firstName;
+        currentUser.lastName = lastName;
+        profileCache = profileCache.map(profile => profile.id === currentUser.id
+            ? {...profile, firstName, lastName, phone, address}
+            : profile);
+        cacheStorageValue("deSoundsource_users", profileCache);
+        cacheStorageValue("deSoundsource_profile_" + currentUser.email, updatedProfile);
+        updateUserUI();
+        renderProfile();
+        showToast("Profile updated successfully.", "success");
+    } catch (error) {
+        reportCloudError("profile update", error);
     }
-
-    const oldProfile =
-        getProfile();
-
-    const updatedProfile = {
-
-        firstName,
-        lastName,
-        email,
-        phone,
-        address,
-        image: oldProfile.image || ""
-
-    };
-
-    storage.set(
-        "deSoundsource_profile_" + email,
-        updatedProfile
-    );
-
-    if (oldEmail !== email) {
-
-        const oldProfileKey =
-            "deSoundsource_profile_" + oldEmail;
-
-        storage.remove(oldProfileKey);
-
-        const oldCartKey =
-            "deSoundsource_cart_" + oldEmail;
-
-        const newCartKey =
-            "deSoundsource_cart_" + email;
-
-        storage.set(
-            newCartKey,
-            storage.get(oldCartKey, [])
-        );
-
-        storage.remove(oldCartKey);
-
-        const oldOrderKey =
-            "deSoundsource_orders_" + oldEmail;
-
-        const newOrderKey =
-            "deSoundsource_orders_" + email;
-
-        storage.set(
-            newOrderKey,
-            storage.get(oldOrderKey, [])
-        );
-
-        storage.remove(oldOrderKey);
-
-    }
-
-    currentUser = {
-        firstName,
-        lastName,
-        email
-    };
-
-    storage.set(
-        "deSoundsource_session",
-        currentUser
-    );
-
-    loadUserData();
-
-    updateUserUI();
-
-    renderProfile();
-
-    showToast(
-        "Profile updated successfully.",
-        "success"
-    );
-
 }
 
 
@@ -2708,7 +2945,7 @@ function handleProfileImage(event) {
 
         const img = new Image();
 
-        img.onload = function() {
+        img.onload = async function() {
 
             const canvas =
                 document.createElement("canvas");
@@ -2759,6 +2996,20 @@ function handleProfileImage(event) {
                 currentUser.email,
                 profile
             );
+
+            try {
+                const {error} = await supabaseClient.from("profiles")
+                    .update({image: compressed})
+                    .eq("id", currentUser.id);
+                if (error) throw error;
+                profileCache = profileCache.map(item => item.id === currentUser.id
+                    ? {...item, image: compressed}
+                    : item);
+                cacheStorageValue("deSoundsource_users", profileCache);
+            } catch (error) {
+                reportCloudError("profile image update", error);
+                return;
+            }
 
             renderProfile();
 
@@ -3429,17 +3680,28 @@ function closeModal(id) {
    LOGOUT
    ========================================================= */
 
-function logout() {
+async function logout() {
 
     if (statusTimer) {
         clearInterval(statusTimer);
         statusTimer = null;
     }
 
-    storage.remove(
-        "deSoundsource_session"
-    );
+    try {
+        await Promise.all(stateWriteQueues.values());
+        if (supabaseClient) {
+            const {error} = await supabaseClient.auth.signOut();
+            if (error) {
+                reportCloudError("sign out", error);
+                return;
+            }
+        }
+    } catch (error) {
+        reportCloudError("sign out", error);
+        return;
+    }
 
+    cloudStateReady = false;
     currentUser = null;
 
     cart = [];
@@ -4130,6 +4392,45 @@ sched();
 .dm{max-width:86%;padding:8px 12px;border-radius:12px;font-size:13.5px}.dm.b{background:var(--background-alt);align-self:flex-start}.dm.u{background:var(--primary);color:#fff;align-self:flex-end}
 .dm button,#dvQr button{margin:6px 4px 0 0;border:1px solid var(--border);background:var(--card);color:var(--text);border-radius:99px;padding:4px 10px;font-size:12px}
 #dvQr{padding:0 12px 6px}.dvin{display:flex;gap:6px;padding:10px;border-top:1px solid var(--border)}.dvin input{flex:1;border:1.5px solid var(--border);border-radius:10px;padding:8px;background:var(--card)}.dvin button{border:0;border-radius:10px;background:var(--primary);color:#fff;padding:0 14px}
+:root{--primary:#16652f;--primary-dark:#14532d;--accent:#06a8a8;--accent-dark:#14848c;--dark:#14532d;--text:#172033;--muted:#667085;--background:#f3f8f4;--background-alt:#e9f3ec;--card:#fff;--border:#dde9df;--sidebar-width:250px;--radius:12px;--shadow:0 2px 8px rgba(20,60,35,.06);--shadow-lg:0 16px 40px rgba(20,60,35,.18);--grad:linear-gradient(135deg,#14532d,#1f7a4d 70%,#2e8b57)}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--background);background-image:none}
+body.dark{--text:#edf7ef;--muted:#a9c5b0;--background:#111b14;--background-alt:#1b2b20;--card:#1d2b21;--border:#34483a;--shadow:0 2px 8px rgba(0,0,0,.3)}
+.auth-screen{background:linear-gradient(rgba(8,45,26,.62),rgba(8,45,26,.76)),url("https://i.pinimg.com/736x/ac/dc/7f/acdc7fc09be8ac5d6059ee0e6bbdf95f.jpg") center/cover}
+.sidebar{background:#16652f}
+.sidebar-header{border-bottom-color:rgba(255,255,255,.16)}
+.sidebar-logo{background:linear-gradient(135deg,#14532d,#2e8b57);box-shadow:0 4px 12px rgba(0,0,0,.16)}
+.sidebar-nav{padding:10px 12px}
+.nav-label{color:#b6dfc2}
+.nav-item{border-radius:12px;padding:11px 14px;margin-bottom:3px;color:#e8f5ec;font-weight:500}
+.nav-item:hover{background:rgba(255,255,255,.1);color:#fff}
+.nav-item.active{background:#e8f3e4;color:#14532d;font-weight:700;box-shadow:inset 0 0 0 2px #cfe3cf}
+.nav-item.active::before{display:none}
+.nav-item.active .nav-icon{filter:grayscale(1) brightness(.35)}
+.sidebar-footer{border-top-color:rgba(255,255,255,.18)}
+.user-mini-email{color:#b6dfc2}
+.logout-btn{background:rgba(255,255,255,.12)}
+.logout-btn:hover{background:var(--danger)}
+.topbar{background:#06a8a8;box-shadow:none;padding-top:12px}
+.topbar-search input{max-width:none;border:1px solid var(--border);border-radius:99px;box-shadow:none}
+.topbar-search>span{z-index:1}
+.topbar .icon-btn{background:rgba(255,255,255,.18)}
+.topbar .icon-btn:hover{background:rgba(255,255,255,.3)}
+.acct-btn{color:#fff}
+.page-header h1{color:#14532d}
+.ac{border-color:#dde9df;box-shadow:0 2px 8px rgba(20,60,35,.06)}
+.ac h3{color:#14532d}
+.tl{background:linear-gradient(135deg,#14532d,#1f7a4d 70%,#2e8b57)}
+.profile-role-badge{background:#e8f3e4;color:#14532d}
+.btn-primary{background:var(--grad);box-shadow:0 4px 12px rgba(20,83,45,.2)}
+.btn-accent{background:#06a8a8;color:#fff}
+.btn-accent:hover{background:#14848c}
+.form-control:focus{border-color:var(--primary);box-shadow:0 0 0 4px rgba(34,163,90,.15)}
+.gate-steps li.on{background:var(--primary)}
+.gate-scroll h4{color:var(--primary)}
+.auth-card,.gate-pane,.ac{background-color:var(--card)}
+.tw th{background:#e9f3ec;color:#1d3326}
+.ticker{background:#14532d}
+@media(max-width:860px){.topbar{background:#06a8a8}}
 </style>
 <script>
 (function(){
@@ -4166,7 +4467,10 @@ window.adAct=(em,id,act)=>{const l=storage.get(OK(em),[]),o=l.find(x=>x.id===id)
  else if(act==="msg"){const t=prompt("Message to the customer about "+id+":");if(!t)return;const sv=prompt("Severity: Minor, Moderate or Severe","Minor")||"Minor",m=msgs();m.push({id:Date.now(),to:em,from:"Admin",subject:"Notice about order "+id,body:t,severity:sv,order:id,ts:Date.now(),read:0,ack:0});storage.set(MK,m);logA("Sent notice to "+em+" ("+id+")");return showToast("Message sent")}
  o.upd=Date.now();storage.set(OK(em),l);showToast("Order updated");go()};
 window.adStock=(id,v)=>{const s=stock();s[id]=Math.max(0,+v||0);storage.set(SK,s);logA("Stock of "+id+" set to "+s[id]);showToast("Stock updated")};
-window.adDelU=em=>{if(!confirm("Delete this customer?"))return;storage.set(U,users().filter(u=>u.email!==em));logA("Deleted user "+em);go()};
+window.adDelU=async em=>{if(!confirm("Disable this customer account?"))return;const profile=profileCache.find(u=>u.email.toLowerCase()===em.toLowerCase());if(!profile)return showToast("Customer account was not found.","error");
+ try{const{error}=await supabaseClient.rpc("deactivate_store_user",{target_user_id:profile.id});if(error)throw error;
+ profileCache=profileCache.map(u=>u.id===profile.id?{...u,is_active:false}:u);cacheStorageValue(U,profileCache);logA("Disabled user "+em);go()}
+ catch(error){reportCloudError("disable customer",error)}};
 window.adAck=id=>{const m=msgs(),x=m.find(y=>y.id===id);x.read=1;x.ack=1;x.ackts=Date.now();storage.set(MK,m);logA("Acknowledged notice "+id);showToast("Thank you. The admin has been notified.");go()};
 window.adReadAll=()=>{const m=msgs();m.forEach(x=>{if(x.to===currentUser.email)x.read=1});storage.set(MK,m);go()};
 window.sendInquiry=e=>{e.preventDefault();const subject=$("#inquirySubject").value.trim(),body=$("#inquiryBody").value.trim();if(!subject||!body)return showToast("Enter a subject and message.","error");
@@ -4175,7 +4479,7 @@ window.adMarkInquiryRead=id=>{const m=msgs(),x=m.find(y=>y.id===id&&y.to===AD);i
 window.adReply=id=>{const L=msgs(),x=L.find(y=>y.id===id&&y.to===AD&&y.type==="inquiry");if(!x)return;const body=prompt("Reply to "+x.from+":", "");if(body===null||!body.trim())return;
  x.read=1;x.status="Replied";const ts=Date.now();L.push({id:ts,to:x.from,from:"Admin",subject:"Re: "+x.subject,body:body.trim(),severity:"Minor",ts,read:0,ack:0,type:"reply",parentId:x.id});storage.set(MK,L);logA("Replied to inquiry from "+x.from);showToast("Reply sent");go()};
 /* ---- mini SQL ---- */
-const TB={users:{cols:["email","firstName","lastName","password"],get:()=>users(),set:v=>storage.set(U,v)},
+const TB={users:{cols:["id","email","firstName","lastName","phone","is_active"],get:()=>users().map(({id,email,firstName,lastName,phone,is_active})=>({id,email,firstName,lastName,phone,is_active})),set:()=>{throw Error("Manage accounts through Customer Management; passwords are never available in the app.")}},
 products:{cols:["id","name","category","brand","price","stock"],get:()=>products.map(p=>({id:p.id,name:p.name,category:p.category,brand:p.brand,price:p.price,stock:qty(p.id)})),set:r=>{const s={};r.forEach(x=>s[x.id]=+x.stock);storage.set(SK,s)}},
 orders:{cols:["id","email","date","total","payment","approval","stage"],get:()=>all().map(({o,email})=>({id:o.id,email,date:o.date.slice(0,10),total:o.total,payment:o.payment,approval:ap(o),stage:st(o)})),set:rows=>users().forEach(u=>{const k=storage.get(OK(u.email),[]).filter(o=>rows.some(r=>r.id===o.id));k.forEach(o=>{const r=rows.find(x=>x.id===o.id);o.approval=r.approval;o.statusIndex=+r.stage;o.lastStatusUpdate=FUT});storage.set(OK(u.email),k)})},
 messages:{cols:["id","to","subject","severity","read","ack"],get:()=>msgs(),set:v=>storage.set(MK,v)},
@@ -4191,7 +4495,7 @@ function sql(q){q=q.trim().replace(/;+$/,"");let m;
  if(m=q.match(/^update\s+(\w+)\s+set\s+(.+?)(?:\s+where\s+(.+))?$/is)){const t=T(m[1]),f=W(m[3]),sets=[...m[2].matchAll(/(\w+)\s*=\s*('[^']*'|[^,]+)/g)].map(x=>[x[1],V(x[2])]);let n=0;const rows=t.get();rows.forEach(r=>{if(f(r)){sets.forEach(([k,v])=>r[k]=v);n++}});t.set(rows);logA("SQL: "+q.slice(0,80));return{msg:n+" row(s) updated"}}
  if(m=q.match(/^delete\s+from\s+(\w+)(?:\s+where\s+(.+))?$/is)){const t=T(m[1]),f=W(m[2]),rows=t.get(),k=rows.filter(r=>!f(r));t.set(k);logA("SQL: "+q.slice(0,80));return{msg:(rows.length-k.length)+" row(s) deleted"}}
  throw Error("Unsupported SQL. Use SELECT, UPDATE or DELETE.")}
-let sqlT="SELECT * FROM orders WHERE approval = 'Pending'",sqlO=null,sp={};
+let sqlT="SELECT * FROM orders WHERE approval = 'Pending'",sqlO=null;
 window.adSql=()=>{sqlT=$("#sqlq").value;try{sqlO=sql(sqlT)}catch(e){sqlO={err:e.message}}go()};
 window.adEx=i=>{sqlT=EX[i];go()};
 const EX=["SELECT * FROM orders WHERE approval = 'Pending'","SELECT * FROM products WHERE stock <= 5 ORDER BY stock","SELECT count(*) FROM users","UPDATE products SET stock = 30 WHERE category = 'Drums'","DELETE FROM logs WHERE user = 'demo@desoundsource.com'"];
@@ -4212,14 +4516,13 @@ a_orders:()=>hd("✅ Orders Management","Approve or reject requests, then move a
 a_products:()=>hd("🎸 Product Management","Review products in the catalog. Use Inventory / Stock Management to adjust quantities.")+`<div class="ac">${tbl(["Product ID","Product","Brand","Category","Price","Stock",""],products.map(p=>`<tr><td>${esc(p.id)}</td><td><b>${esc(p.name)}</b></td><td>${esc(p.brand)}</td><td>${esc(p.category)}</td><td>${php(p.price)}</td><td>${qty(p.id)}</td><td><button class="btn btn-outline sm" onclick="navigate('a_stock')">Manage stock</button></td></tr>`))}</div><p class="mu">Catalog details are built into this demo; stock quantities can be changed in Inventory / Stock Management.</p>`,
 a_categories:()=>{const C=[...new Set(products.map(p=>p.category).filter(Boolean))].sort((a,b)=>a.localeCompare(b));return hd("🗂️ Categories Management","Category groups are derived from the product catalog in this demo.")+`<div class="ac">${C.length?tbl(["Category","Products","Product list"],C.map(c=>{const items=products.filter(p=>p.category===c);return `<tr><td><b>${esc(c)}</b></td><td>${items.length}</td><td>${items.map(p=>esc(p.name)).join(", ")}</td></tr>`})): '<p class="mu">No categories are listed.</p>'}</div><p class="mu">To add or rename a category, update the catalog product data in this single-file demo.</p>`},
 a_stock:()=>hd("📦 Inventory / Stock Management","Set available stock. Approving an order deducts the ordered quantities.")+`<div class="ac">${tbl(["Product","Category","Current Stock","Update Stock"],products.map(p=>`<tr><td><b>${esc(p.name)}</b><br><small class="mu">${esc(p.brand)}</small></td><td>${esc(p.category)}</td><td>${qty(p.id)}</td><td><input type="number" min="0" value="${qty(p.id)}" style="width:90px" onchange="adStock('${p.id}',this.value)" aria-label="Stock for ${esc(p.name)}"></td></tr>`))}</div>`,
-a_users:()=>hd("👥 Customer Management","Registered customer accounts and their order counts.")+`<div class="ac">${tbl(["Customer","Email","Role","Password","Orders",""],users().filter(u=>u.email.toLowerCase()!==AD).map(u=>`<tr><td>${esc(u.firstName+" "+u.lastName)}</td><td>${esc(u.email)}</td><td>Customer</td><td>${sp[u.email]?esc(u.password):"••••••••"} <button class="btn btn-outline sm" onclick="adSp('${u.email}')">${sp[u.email]?"Hide":"Show"}</button></td><td>${storage.get(OK(u.email),[]).length}</td><td><button class="btn btn-danger sm" onclick="adDelU('${u.email}')">Delete</button></td></tr>`))}</div>`,
+a_users:()=>hd("👥 Customer Management","Registered customer accounts and their order counts.")+`<div class="ac">${tbl(["Customer","Email","Role","Status","Orders",""],users().filter(u=>u.email.toLowerCase()!==AD&&u.is_active!==false).map(u=>`<tr><td>${esc(u.firstName+" "+u.lastName)}</td><td>${esc(u.email)}</td><td>Customer</td><td>Active</td><td>${storage.get(OK(u.email),[]).length}</td><td><button class="btn btn-danger sm" onclick="adDelU('${u.email}')">Disable</button></td></tr>`))}</div>`,
 a_messages:()=>{const L=msgs().filter(m=>m.to===AD&&m.type==="inquiry").sort((a,b)=>b.ts-a.ts);return hd("✉️ Messages / Inquiries","Read customer questions and reply from the admin account.")+`<div class="ac">${L.length?tbl(["Status","Customer","Subject","Message","Received","Actions"],L.map(m=>`<tr><td><span class="bd ${m.status==="Replied"?"Approved":"Pending"}">${esc(m.status||"Open")}</span></td><td>${esc(m.from)}</td><td>${esc(m.subject)}</td><td>${esc(m.body)}</td><td>${new Date(m.ts).toLocaleString()}</td><td>${!m.read?`<button class="btn btn-outline sm" onclick="adMarkInquiryRead(${m.id})">Mark read</button>`:""}<button class="btn btn-primary sm" onclick="adReply(${m.id})">Reply</button></td></tr>`)):'<p class="mu">No customer inquiries yet.</p>'}</div>`},
 a_profile:()=>hd("⚙️ Admin Profile & Settings","Review your administrator account and open profile or preference settings.")+`<div class="ac"><h3>Administrator account</h3><p><b>${esc((currentUser.firstName||"")+" "+(currentUser.lastName||""))}</b></p><p>${esc(currentUser.email)}</p><p>Role: <span class="profile-role-badge">Admin</span></p><button class="btn btn-primary sm" onclick="openAccount('profile')">Edit profile</button> <button class="btn btn-outline sm" onclick="openAccount('settings')">Open settings</button></div>`,
 a_sellers:()=>{const brands=[...new Set(products.map(p=>p.brand).filter(Boolean))].sort((a,b)=>a.localeCompare(b));return hd("🏷️ Sellers & Suppliers","Supplier overview based on product brands. This demo does not have separate seller accounts.")+`<div class="ac">${brands.length?tbl(["Brand / Supplier","Products","Categories","Catalog"],brands.map(brand=>{const items=products.filter(p=>p.brand===brand),categories=[...new Set(items.map(p=>p.category))];return `<tr><td><b>${esc(brand)}</b></td><td>${items.length}</td><td>${categories.map(esc).join(", ")}</td><td>${items.map(p=>esc(p.name)).join(", ")}</td></tr>`})): '<p class="mu">No brands are listed in the product catalog.</p>'}</div>`},
 a_reports:()=>{const A=all(),approved=A.filter(x=>ap(x.o)==="Approved"),pending=A.filter(x=>ap(x.o)==="Pending"),rejected=A.filter(x=>ap(x.o)==="Rejected"),sales=approved.reduce((sum,x)=>sum+(Number(x.o.total)||0),0),units=approved.reduce((sum,x)=>sum+x.o.items.reduce((n,i)=>n+(Number(i.quantity)||0),0),0);return hd("📈 Sales & Revenue Analytics","Summary of orders and approved sales saved in this browser.")+`<div class="tls">${[["💰","Approved Sales",php(sales)],["🧾","Total Orders",A.length],["⏳","Pending Orders",pending.length],["↩️","Rejected Orders",rejected.length],["📦","Approved Units",units]].map(t=>`<div class="tl"><i>${t[0]}</i><b>${t[2]}</b><span>${t[1]}</span></div>`).join("")}</div><div class="ac"><h3>📊 Order Status</h3>${tbl(["Status","Orders"],[["Pending",pending.length],["Approved",approved.length],["Rejected",rejected.length]].map(([label,count])=>`<tr><td>${label}</td><td>${count}</td></tr>`))}</div>`},
 a_log:()=>hd("📜 System Activity Log","Every login, order and admin action.")+`<div class="ac">${logs().length?`<button class="btn btn-danger sm" onclick="if(confirm('Clear the log?')){storage.set('${LK}',[]);navigate('a_log')}">Clear log</button>`+tbl(["Time","User","Action"],[...logs()].reverse().slice(0,150).map(l=>`<tr><td>${esc(l.time)}</td><td>${esc(l.user)}</td><td>${esc(l.action)}</td></tr>`)):'<p class="mu">No activity yet.</p>'}</div>`,
 a_sql:()=>{const o=sqlO;return hd("🗄️ Database (SQL)","Run SELECT, UPDATE and DELETE on the shop data.")+`<div class="ac"><p class="mu">Tables: ${Object.entries(TB).map(([t,x])=>`<span class="bd Approved" title="${x.cols.join(", ")}">${t} (${x.cols.join(", ")})</span>`).join(" ")}</p><textarea id="sqlq" rows="3" spellcheck="false" style="width:100%;font-family:monospace" onkeydown="if(event.ctrlKey&&event.key=='Enter')adSql()">${esc(sqlT)}</textarea><p><button class="btn btn-primary sm" onclick="adSql()">▶ Run query</button> ${EX.map((q,i)=>`<button class="btn btn-outline sm" onclick="adEx(${i})">${q.split(" ").slice(0,3).join(" ")}…</button>`).join(" ")}</p></div>`+(o?`<div class="ac">${o.err?`<p style="color:var(--danger)">⚠ ${esc(o.err)}</p>`:o.msg?`<p style="color:var(--success)">✔ ${esc(o.msg)}</p>`:`<p class="mu">${o.rows.length} row(s)</p>`+tbl(o.cols,o.rows.map(r=>`<tr>${o.cols.map(k=>`<td>${esc(r[k])}</td>`).join("")}</tr>`))}</div>`:"")}};
-window.adSp=e=>{sp[e]=!sp[e];go()};
 /* ---- wiring ---- */
 const host=$("#page-orders").parentNode;Object.keys(R).forEach(k=>{const s=document.createElement("section");s.id="page-"+k;s.className="page";host.appendChild(s)});
 const nv=window.navigate;
